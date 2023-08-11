@@ -21,9 +21,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
+	"strconv"
+	"sync"
+	"unsafe"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,8 +41,10 @@ import (
 	"k8s.io/apiserver/pkg/util/dryrun"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	policyclient "k8s.io/client-go/kubernetes/typed/policy/v1"
+	"k8s.io/klog/v2"
 	podutil "k8s.io/kubernetes/pkg/api/pod"
 	api "k8s.io/kubernetes/pkg/apis/core"
+	corev1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/client"
@@ -116,6 +124,139 @@ func NewStorage(optsGetter generic.RESTOptionsGetter, k client.ConnectionInfoGet
 		Attach:              &podrest.AttachREST{Store: store, KubeletConn: k},
 		PortForward:         &podrest.PortForwardREST{Store: store, KubeletConn: k},
 	}, nil
+}
+
+// Implement ListCallbacker.
+var _ = rest.ListCallbacker(&REST{})
+
+var podListPool = sync.Pool{
+	New: func() interface{} {
+		return &api.PodList{
+			Items: make([]api.Pod, 0, 64),
+		}
+	},
+}
+
+var podPool = sync.Pool{
+	New: func() interface{} {
+		return new(v1.Pod)
+	},
+}
+
+var podZero = v1.Pod{}
+
+func newPod() *v1.Pod {
+	pod := podPool.Get().(*v1.Pod)
+	prev := pod
+	// reset pod
+	*pod = podZero
+	// pod.TypeMeta.APIVersion = "v1"
+	// pod.TypeMeta.Kind = "Pod"
+	// reuse previous slices and maps
+	pod.ObjectMeta.Labels = prev.ObjectMeta.Labels
+	pod.ObjectMeta.Annotations = prev.ObjectMeta.Annotations
+	pod.ObjectMeta.OwnerReferences = prev.ObjectMeta.OwnerReferences[:0]
+	pod.ObjectMeta.Finalizers = prev.ObjectMeta.Finalizers[:0]
+	pod.ObjectMeta.ManagedFields = prev.ObjectMeta.ManagedFields[:0]
+	pod.Spec.Volumes = prev.Spec.Volumes[:0]
+	pod.Spec.InitContainers = prev.Spec.InitContainers[:0]
+	pod.Spec.EphemeralContainers = prev.Spec.EphemeralContainers[:0]
+	pod.Spec.NodeSelector = prev.Spec.NodeSelector
+	pod.Spec.ImagePullSecrets = prev.Spec.ImagePullSecrets[:0]
+	pod.Spec.Tolerations = prev.Spec.Tolerations[:0]
+	pod.Spec.HostAliases = prev.Spec.HostAliases[:0]
+	pod.Spec.ReadinessGates = prev.Spec.ReadinessGates[:0]
+	pod.Spec.Overhead = prev.Spec.Overhead
+	pod.Spec.TopologySpreadConstraints = prev.Spec.TopologySpreadConstraints[:0]
+	pod.Status.Conditions = prev.Status.Conditions[:0]
+	pod.Status.PodIPs = prev.Status.PodIPs[:0]
+	pod.Status.InitContainerStatuses = prev.Status.InitContainerStatuses[:0]
+	pod.Status.ContainerStatuses = prev.Status.ContainerStatuses[:0]
+	pod.Status.EphemeralContainerStatuses = prev.Status.EphemeralContainerStatuses[:0]
+	// clear map
+	for k := range pod.ObjectMeta.Labels {
+		delete(pod.ObjectMeta.Labels, k)
+	}
+	for k := range pod.ObjectMeta.Annotations {
+		delete(pod.ObjectMeta.Annotations, k)
+	}
+	for k := range pod.Spec.NodeSelector {
+		delete(pod.Spec.NodeSelector, k)
+	}
+	for k := range pod.Spec.Overhead {
+		delete(pod.Spec.Overhead, k)
+	}
+	return pod
+}
+
+func (r *REST) ListCallback(ctx context.Context, options *metainternalversion.ListOptions, callback func(object runtime.Object)) error {
+	// pick list from pool if it is a list all pods request
+	list := podListPool.Get().(*api.PodList)
+	list.Continue = ""
+	list.RemainingItemCount = nil
+	list.Items = list.Items[:0]
+	defer podListPool.Put(list)
+
+	klog.V(3).Infof("podstore: ListCallback pick a pod list from pool, len=%d cap=%d", len(list.Items), cap(list.Items))
+
+	pods := []*v1.Pod{}
+	defer func() {
+		for _, pod := range pods {
+			podPool.Put(pod)
+		}
+	}()
+
+	appendListItem := func(v reflect.Value, data []byte, rev uint64, pred storage.SelectionPredicate, codec runtime.Codec, versioner storage.Versioner, newItemFunc func() runtime.Object) error {
+		// proto unmarshal
+		unk := runtime.Unknown{}
+		if err := unk.Unmarshal(data); err != nil {
+			return err
+		}
+
+		// new a cleaned v1.Pod
+		pod := newPod()
+		if err := pod.Unmarshal(unk.Raw); err != nil {
+			podPool.Put(pod)
+			return err
+		}
+
+		// return pool immediately if not matched, otherwise put it to outer []*v1.Pod then return pool later
+		if matched, err := pred.Matches(pod); err != nil || !matched {
+			podPool.Put(pod)
+			return nil
+		} else {
+			pods = append(pods, pod)
+		}
+
+		// reuse or create a *core.Pod then convert *v1.Pod to it
+		if len(list.Items) < cap(list.Items) {
+			hdr := (*reflect.SliceHeader)(unsafe.Pointer(&list.Items))
+			hdr.Len++
+			klog.V(4).Infof("podstore: ListCallback reuse an existing pod slot, hdr.Len=%d, cap=%d", hdr.Len, cap(list.Items))
+		} else {
+			list.Items = append(list.Items, api.Pod{})
+			klog.V(4).Infof("podstore: ListCallback create a new pod to pod list, len=%d, cap=%d", len(list.Items), cap(list.Items))
+		}
+		item := &list.Items[len(list.Items)-1]
+		if err := corev1.Convert_v1_Pod_To_core_Pod(pod, item, nil); err != nil {
+			return err
+		}
+		item.ObjectMeta.ResourceVersion = strconv.FormatUint(rev, 10)
+
+		klog.V(4).Infof("podstore: ListCallback append a matched pod to pod list, name=%s len=%d, cap=%d", item.Name, len(list.Items), cap(list.Items))
+
+		return nil
+	}
+
+	err := r.Store.GetList(ctx, options, list, appendListItem)
+	if err != nil {
+		return err
+	}
+
+	klog.V(3).Infof("podstore: ListCallback get a pod list result, len=%d cap=%d", len(list.Items), cap(list.Items))
+
+	callback(list)
+	return nil
 }
 
 // Implement Redirector.

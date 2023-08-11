@@ -625,11 +625,19 @@ func (c *Cacher) listItems(listRV uint64, key string, pred storage.SelectionPred
 
 // GetList implements storage.Interface
 func (c *Cacher) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+	return c.GetListWithItemFunc(ctx, key, opts, listObj, nil)
+}
+
+func (c *Cacher) GetListWithItemFunc(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object, appendListItemFunc storage.AppendListItemFunc) error {
 	recursive := opts.Recursive
 	resourceVersion := opts.ResourceVersion
 	pred := opts.Predicate
 	if shouldDelegateList(opts) {
-		return c.storage.GetList(ctx, key, opts, listObj)
+		if lister, ok := c.storage.(storage.InterfaceGetListWithItemFunc); ok {
+			return lister.GetListWithItemFunc(ctx, key, opts, listObj, appendListItemFunc)
+		} else {
+			return c.storage.GetList(ctx, key, opts, listObj)
+		}
 	}
 
 	// If resourceVersion is specified, serve it from cache.

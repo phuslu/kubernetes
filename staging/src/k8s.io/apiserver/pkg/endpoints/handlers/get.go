@@ -272,6 +272,18 @@ func ListResource(r rest.Lister, rw rest.Watcher, scope *RequestScope, forceWatc
 			return
 		}
 
+		if cb, ok := r.(rest.ListCallbacker); ok {
+			// Log only long List requests (ignore Watch).
+			defer trace.LogIfLong(500 * time.Millisecond)
+			trace.Step("About to List from storage")
+			cb.ListCallback(ctx, &opts, func(result runtime.Object) {
+				trace.Step("Listing from storage done")
+				transformResponseObject(ctx, scope, trace, req, w, http.StatusOK, outputMediaType, result)
+				trace.Step("Writing http response done", utiltrace.Field{"count", meta.LenList(result)})
+			})
+			return
+		}
+
 		// Log only long List requests (ignore Watch).
 		defer trace.LogIfLong(500 * time.Millisecond)
 		trace.Step("About to List from storage")

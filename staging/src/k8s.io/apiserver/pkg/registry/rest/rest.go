@@ -110,6 +110,11 @@ type Lister interface {
 	TableConvertor
 }
 
+type ListCallbacker interface {
+	// List selects resources in the storage which match to the selector and apply a callback. 'options' can be nil.
+	ListCallback(ctx context.Context, options *metainternalversion.ListOptions, callback func(object runtime.Object)) error
+}
+
 // Getter is an object that can retrieve a named RESTful resource.
 type Getter interface {
 	// Get finds a resource in the storage by name and returns it.

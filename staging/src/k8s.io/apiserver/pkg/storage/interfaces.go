@@ -19,6 +19,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -235,6 +236,12 @@ type Interface interface {
 
 	// Count returns number of different entries under the key (generally being path prefix).
 	Count(key string) (int64, error)
+}
+
+type AppendListItemFunc func(v reflect.Value, data []byte, rev uint64, pred SelectionPredicate, codec runtime.Codec, versioner Versioner, newItemFunc func() runtime.Object) error
+
+type InterfaceGetListWithItemFunc interface {
+	GetListWithItemFunc(ctx context.Context, key string, opts ListOptions, listObj runtime.Object, appendListItemFunc AppendListItemFunc) error
 }
 
 // GetOptions provides the options that may be provided for storage get operations.

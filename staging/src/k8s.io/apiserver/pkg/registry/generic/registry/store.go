@@ -362,6 +362,55 @@ func (e *Store) ListPredicate(ctx context.Context, p storage.SelectionPredicate,
 	return list, storeerr.InterpretListError(err, qualifiedResource)
 }
 
+func (e *Store) GetList(ctx context.Context, options *metainternalversion.ListOptions, list runtime.Object, appendListItemFunc storage.AppendListItemFunc) error {
+	label := labels.Everything()
+	if options != nil && options.LabelSelector != nil {
+		label = options.LabelSelector
+	}
+	field := fields.Everything()
+	if options != nil && options.FieldSelector != nil {
+		field = options.FieldSelector
+	}
+
+	if options == nil {
+		// By default we should serve the request from etcd.
+		options = &metainternalversion.ListOptions{ResourceVersion: ""}
+	}
+	p := e.PredicateFunc(label, field)
+	p.Limit = options.Limit
+	p.Continue = options.Continue
+	qualifiedResource := e.qualifiedResourceFromContext(ctx)
+	storageOpts := storage.ListOptions{
+		ResourceVersion:      options.ResourceVersion,
+		ResourceVersionMatch: options.ResourceVersionMatch,
+		Predicate:            p,
+		Recursive:            true,
+	}
+	if name, ok := p.MatchesSingle(); ok {
+		if key, err := e.KeyFunc(ctx, name); err == nil {
+			storageOpts.Recursive = false
+			err := e.Storage.GetList(ctx, key, storageOpts, list)
+			return storeerr.InterpretListError(err, qualifiedResource)
+		}
+		// if we cannot extract a key based on the current context, the optimization is skipped
+	}
+
+	// try to list with user-defined appendListItemFunc
+	var err error
+	if lister, ok := e.Storage.Storage.(storage.InterfaceGetListWithItemFunc); ok {
+		err = lister.GetListWithItemFunc(ctx, e.KeyRootFunc(ctx), storageOpts, list, appendListItemFunc)
+	} else {
+		err = e.Storage.GetList(ctx, e.KeyRootFunc(ctx), storageOpts, list)
+	}
+	if err != nil {
+		return err
+	}
+	if e.Decorator != nil {
+		e.Decorator(list)
+	}
+	return nil
+}
+
 // finishNothing is a do-nothing FinishFunc.
 func finishNothing(context.Context, bool) {}
 

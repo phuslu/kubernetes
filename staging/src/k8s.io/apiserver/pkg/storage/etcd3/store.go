@@ -581,7 +581,12 @@ func encodeContinue(key, keyPrefix string, resourceVersion int64) (string, error
 }
 
 // GetList implements storage.Interface.
+
 func (s *store) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+	return s.GetListWithItemFunc(ctx, key, opts, listObj, nil)
+}
+
+func (s *store) GetListWithItemFunc(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object, appendListItemFunc storage.AppendListItemFunc) error {
 	preparedKey, err := s.prepareKey(key)
 	if err != nil {
 		return err
@@ -757,7 +762,11 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 				return storage.NewInternalErrorf("unable to transform key %q: %v", kv.Key, err)
 			}
 
-			if err := appendListItem(v, data, uint64(kv.ModRevision), pred, s.codec, s.versioner, newItemFunc); err != nil {
+			if appendListItemFunc == nil {
+				appendListItemFunc = appendListItem
+			}
+
+			if err := appendListItemFunc(v, data, uint64(kv.ModRevision), pred, s.codec, s.versioner, newItemFunc); err != nil {
 				return err
 			}
 			numEvald++
